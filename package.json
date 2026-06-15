@@ -1,0 +1,21 @@
+{
+  "name": "vix-hub-pro",
+  "version": "1.0.0",
+  "description": "Stremio addon that routes requests to ViX streaming URLs",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "DEBUG=true node index.js"
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.9.10",
+    "axios": "^1.18.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "stremio-addon-sdk": "^1.6.10"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
