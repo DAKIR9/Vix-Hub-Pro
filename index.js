@@ -148,6 +148,7 @@ async function detectMissingVixEpisodes(imdbId, coreId, schema, tvdbEpisodes) {
 
     while (vixSeason <= 50) {
         const seasonNums = new Set();
+        console.log(`[GAP DETECTION] Scanning ViX Season ${vixSeason}…`);
 
         if (schema.type === "year-based") {
             const year = schema.startYear + (vixSeason - 1);
@@ -166,7 +167,10 @@ async function detectMissingVixEpisodes(imdbId, coreId, schema, tvdbEpisodes) {
                 const js = JSON.stringify(raw);
                 if (!/video:(?:mcp:)?\d+/.test(js)) break;
                 for (const n of getEpisodeNumbers(js)) seasonNums.add(n);
-            } catch { break; }
+            } catch (err) {
+                console.log(`[GAP DETECTION] Season ${vixSeason} fetch failed: ${err.message} — stopping`);
+                break;
+            }
 
         } else {
             // chunk-based: scan all batches
@@ -190,12 +194,18 @@ async function detectMissingVixEpisodes(imdbId, coreId, schema, tvdbEpisodes) {
                     hadAny = true;
                     for (const n of getEpisodeNumbers(js)) seasonNums.add(n);
                     batch++;
-                } catch { break; }
+                } catch (err) {
+                    console.log(`[GAP DETECTION] Season ${vixSeason} batch ${batch} fetch failed: ${err.message}`);
+                    break;
+                }
             }
             if (!hadAny) break;
         }
 
-        if (seasonNums.size === 0) break;
+        if (seasonNums.size === 0) {
+            console.log(`[GAP DETECTION] Season ${vixSeason} is empty — stopping scan`);
+            break;
+        }
         vixEpsByseason.push({ vixSeason, nums: seasonNums });
         log.info(`ViX S${vixSeason} episode numbers present: ${[...seasonNums].sort((a,b)=>a-b).slice(0,10).join(",")}…`);
         vixSeason++;
@@ -1242,6 +1252,152 @@ builder.defineStreamHandler(async (args) => {
 const addonInterface = builder.getInterface();
 const app = express();
 
+// ─────────────────────────────────────────────
+// Settings UI — Allow users to configure TVDB key via web
+// ─────────────────────────────────────────────
+const settingsFile = "./settings.json";
+
+function loadSettings() {
+    try {
+        const fs = require("fs");
+        if (fs.existsSync(settingsFile)) {
+            const data = fs.readFileSync(settingsFile, "utf8");
+            return JSON.parse(data);
+        }
+    } catch (err) {
+        console.warn(`Settings load failed: ${err.message}`);
+    }
+    return { tvdbApiKey: "" };
+}
+
+function saveSettings(settings) {
+    try {
+        const fs = require("fs");
+        fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2), "utf8");
+    } catch (err) {
+        console.error(`Settings save failed: ${err.message}`);
+    }
+}
+
+// Load saved settings
+let settings = loadSettings();
+if (settings.tvdbApiKey && !CONFIG.TVDB_API_KEY) {
+    CONFIG.TVDB_API_KEY = settings.tvdbApiKey;
+    console.log("[Settings] Loaded TVDB API key from settings.json");
+}
+
+// Settings UI endpoint
+app.get("/settings", (req, res) => {
+    const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Vix Hub Pro - Settings</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; background: #f5f5f5; }
+            .container { background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { color: #333; }
+            .form-group { margin: 20px 0; }
+            label { display: block; margin-bottom: 8px; font-weight: bold; color: #555; }
+            input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box; }
+            button { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; width: 100%; }
+            button:hover { background: #0056b3; }
+            .status { margin-top: 20px; padding: 12px; border-radius: 4px; text-align: center; display: none; }
+            .status.success { background: #d4edda; color: #155724; }
+            .status.error { background: #f8d7da; color: #721c24; }
+            .info { background: #e7f3ff; padding: 12px; border-radius: 4px; margin-bottom: 20px; font-size: 13px; color: #004085; }
+            a { color: #007bff; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🎬 Vix Hub Pro Settings</h1>
+            <div class="info">
+                Get your free TVDB API key: <a href="https://www.thetvdb.com/api-information" target="_blank">thetvdb.com/api-information</a>
+            </div>
+            <form id="settingsForm">
+                <div class="form-group">
+                    <label for="tvdbKey">TVDB API Key:</label>
+                    <input type="password" id="tvdbKey" name="tvdbKey" placeholder="Enter your TVDB API key" required>
+                </div>
+                <button type="submit">Save Settings</button>
+            </form>
+            <div id="status" class="status"></div>
+        </div>
+        <script>
+            // Load current settings
+            fetch("/api/settings")
+                .then(r => r.json())
+                .then(data => {
+                    if (data.tvdbApiKey) {
+                        document.getElementById("tvdbKey").value = "••••••••••••••";
+                    }
+                })
+                .catch(err => console.error("Load failed:", err));
+            
+            // Save settings
+            document.getElementById("settingsForm").addEventListener("submit", async (e) => {
+                e.preventDefault();
+                const tvdbKey = document.getElementById("tvdbKey").value.trim();
+                
+                if (!tvdbKey) {
+                    showStatus("Please enter your TVDB API key", "error");
+                    return;
+                }
+                
+                try {
+                    const res = await fetch("/api/settings", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ tvdbApiKey: tvdbKey })
+                    });
+                    
+                    if (res.ok) {
+                        showStatus("✓ Settings saved! Addon will restart...", "success");
+                        setTimeout(() => window.location.reload(), 2000);
+                    } else {
+                        showStatus("Error saving settings", "error");
+                    }
+                } catch (err) {
+                    showStatus("Error: " + err.message, "error");
+                }
+            });
+            
+            function showStatus(msg, type) {
+                const el = document.getElementById("status");
+                el.textContent = msg;
+                el.className = "status " + type;
+                el.style.display = "block";
+            }
+        </script>
+    </body>
+    </html>
+    `;
+    res.setHeader("Content-Type", "text/html");
+    res.send(html);
+});
+
+// API endpoint to get/save settings
+app.get("/api/settings", (req, res) => {
+    res.json({ tvdbApiKey: CONFIG.TVDB_API_KEY ? "***hidden***" : "" });
+});
+
+app.post("/api/settings", express.json(), (req, res) => {
+    const { tvdbApiKey } = req.body;
+    if (tvdbApiKey) {
+        CONFIG.TVDB_API_KEY = tvdbApiKey;
+        settings.tvdbApiKey = tvdbApiKey;
+        saveSettings(settings);
+        console.log("[Settings] TVDB API key updated");
+        res.json({ success: true });
+    } else {
+        res.status(400).json({ error: "tvdbApiKey required" });
+    }
+});
+
+// ─────────────────────────────────────────────
+
 // /proxy/mpd/:key — serve ad-stripped DASH manifests
 app.get("/proxy/mpd/:key", (req, res) => {
     const entry = mpdProxyCache.get(req.params.key);
@@ -1253,8 +1409,6 @@ app.get("/proxy/mpd/:key", (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.send(entry.mpdText);
 });
-
-// Mount the addon SDK router if available, otherwise fall back to serveHTTP
 if (typeof addonInterface.getRouter === "function") {
     app.use(addonInterface.getRouter());
     app.listen(CONFIG.PORT, () => {
