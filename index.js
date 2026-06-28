@@ -11,7 +11,32 @@ try {
 }
 
 // ─────────────────────────────────────────────
-// Configuration
+// JWT Token Cache (30-min TTL) — Reuse tokens from previous requests
+// Dramatically speeds up repeated episodes (1-2s instead of 5-15s)
+// ─────────────────────────────────────────────
+const JWT_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const jwtTokenCache = new Map(); // videoId → { token, expiresAt }
+
+function getCachedJWT(videoId) {
+    const entry = jwtTokenCache.get(videoId);
+    if (entry && entry.expiresAt > Date.now()) {
+        log.info(`[CACHE HIT] JWT for video ${videoId} (expires in ${Math.round((entry.expiresAt - Date.now()) / 1000)}s)`);
+        return entry.token;
+    }
+    if (entry) {
+        jwtTokenCache.delete(videoId);
+    }
+    return null;
+}
+
+function cacheJWT(videoId, token) {
+    jwtTokenCache.set(videoId, {
+        token,
+        expiresAt: Date.now() + JWT_CACHE_TTL_MS,
+    });
+    log.info(`[CACHE SAVE] JWT for video ${videoId} (valid for 30 min)`);
+}
+
 // ─────────────────────────────────────────────
 // Auto-detect LAN IP so MPD proxy URLs are reachable from other devices (e.g. a TV).
 // Set PROXY_HOST env var to override (e.g. PROXY_HOST=192.168.1.50).
@@ -987,37 +1012,57 @@ async function getCleanMpdUrl(originalMpdUrl, localBaseUrl) {
     }
 }
 // ─────────────────────────────────────────────
-// Lightweight stream resolver (no browser needed)
-//
-// ViX's Next.js server embeds a fresh, signed Lura JWT
-// directly in the server-rendered video page as
-// "videoToken":"eyJ...". That JWT is POSTed as
-// `token=<jwt>` (application/x-www-form-urlencoded) to
-// https://nxs.mp.lura.live/v1/play/{videoId}?guid={uuid}
-// which returns a JSON player config whose
-// content.media[] array contains the direct MPD/HLS URLs.
+// Puppeteer-based stream resolver with JWT caching
+// First request: 5-15s (launches browser)
+// Cached requests: 1-2s (reuses JWT, no browser)
 // ─────────────────────────────────────────────
 async function getStreamUrlFromVix(videoPageUrl, numericVideoId) {
     try {
-        const { data: html } = await axios.get(videoPageUrl, {
-            headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
-            },
-            timeout: CONFIG.REQUEST_TIMEOUT_MS,
-            responseType: "text",
-        });
+        // Step 1: Check JWT cache — if valid, skip Puppeteer entirely (FAST PATH)
+        let luraToken = getCachedJWT(numericVideoId);
+        
+        if (!luraToken) {
+            // Step 2: Cache miss — launch Puppeteer to extract fresh JWT
+            log.info(`[PUPPETEER] Launching browser for video ${numericVideoId}...`);
+            const puppeteer = (await import("puppeteer")).default;
+            let browser;
+            try {
+                browser = await puppeteer.launch({
+                    headless: "new",
+                    args: [
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--mute-audio",
+                    ],
+                });
 
-        // Search for JWT token (header.payload.signature pattern)
-        // Token is injected via JavaScript, so we search for the raw JWT pattern
-        const jwtMatch = html.match(/eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+/);
-        if (!jwtMatch) {
-            log.warn(`No JWT token found in page: ${videoPageUrl}`);
-            return null;
+                const page = await browser.newPage();
+                await page.goto(videoPageUrl, {
+                    waitUntil: "domcontentloaded", // Faster than networkidle2
+                    timeout: 20_000,
+                });
+
+                // Extract JWT from page HTML
+                const pageContent = await page.content();
+                const tokenMatch = pageContent.match(/eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+/);
+                
+                if (!tokenMatch) {
+                    log.warn(`No JWT found in page for video ${numericVideoId}`);
+                    return null;
+                }
+
+                luraToken = tokenMatch[0];
+                cacheJWT(numericVideoId, luraToken); // Cache for next 30 min
+                log.info(`[PUPPETEER] JWT extracted and cached for video ${numericVideoId}`);
+
+            } finally {
+                if (browser) await browser.close().catch(() => {});
+            }
         }
-        const luraToken = jwtMatch[0];
 
+        // Step 3: POST JWT to Lura API (same as lightweight resolver)
         const { randomUUID } = await import("crypto");
         const guid = randomUUID();
         const playUrl = `https://nxs.mp.lura.live/v1/play/${numericVideoId}?guid=${guid}`;
@@ -1053,16 +1098,17 @@ async function getStreamUrlFromVix(videoPageUrl, numericVideoId) {
 
         const media = playerConfig?.content?.media || [];
 
-        const dashEntry = media.find(m => m.type === "application/dash+xml");
-        if (dashEntry?.url) {
-            log.info(`Resolved MPD URL via lightweight API for video ${numericVideoId}`);
-            return dashEntry.url;
-        }
-
+        // Try HLS first (might not have DRM), fall back to DASH
         const hlsEntry = media.find(m => m.type === "application/x-mpegURL");
         if (hlsEntry?.url) {
-            log.info(`Resolved HLS URL via lightweight API for video ${numericVideoId}`);
+            log.info(`Resolved HLS URL via Lura API for video ${numericVideoId}: ${hlsEntry.url}`);
             return hlsEntry.url;
+        }
+
+        const dashEntry = media.find(m => m.type === "application/dash+xml");
+        if (dashEntry?.url) {
+            log.info(`Resolved DASH URL via Lura API for video ${numericVideoId}: ${dashEntry.url}`);
+            return dashEntry.url;
         }
 
         log.warn(`No media URL found in Lura player config for video ${numericVideoId}`);
@@ -1205,37 +1251,101 @@ builder.defineStreamHandler(async (args) => {
             }
         }
 
-        // 6 — Resolve stream URL via lightweight HTML+API resolver (no browser)
+// Cache for DRM pre-load so we don't re-launch Puppeteer multiple times
+const drmPreloadCache = new Map();
+
+// ─────────────────────────────────────────────
+// Puppeteer DRM Pre-loader (non-blocking background task)
+// Loads page in Puppeteer to ensure Widevine DRM license is obtained
+// This happens after the fast JWT method returns, so it doesn't delay response
+// Cached so we don't re-load the same video multiple times
+// ─────────────────────────────────────────────
+async function ensureDrmReady(videoPageUrl) {
+    // Check if we already pre-loaded this URL recently (within 1 hour)
+    if (drmPreloadCache.has(videoPageUrl)) {
+        const cached = drmPreloadCache.get(videoPageUrl);
+        if (Date.now() - cached < 3600000) { // 1 hour
+            return; // Already pre-loaded, skip
+        }
+    }
+
+    let browser;
+    try {
+        const puppeteer = (await import("puppeteer")).default;
+        browser = await puppeteer.launch({
+            headless: "new",
+            args: [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--mute-audio",
+            ],
+        });
+
+        const page = await browser.newPage();
+        await page.setUserAgent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+            "AppleWebKit/537.36 (KHTML, like Gecko) " +
+            "Chrome/124.0.0.0 Safari/537.36"
+        );
+
+        // Load page to trigger DRM license fetch
+        // Wait only for navigation, don't wait for all resources
+        await page.goto(videoPageUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: 15000,
+        });
+
+        // Give the page a moment to establish DRM context
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Mark as cached
+        drmPreloadCache.set(videoPageUrl, Date.now());
+        log.info(`DRM pre-load cached for ${videoPageUrl.substring(0, 50)}...`);
+    } catch (err) {
+        log.warn(`DRM pre-load error (non-blocking): ${err.message}`);
+    } finally {
+        if (browser) await browser.close().catch(() => {});
+    }
+}
+
+// ─────────────────────────────────────────────
         let m3u8Url = null;
         if (videoToken) {
             const numericVideoId = videoToken.match(/\d+/)?.[0];
             if (numericVideoId) {
                 m3u8Url = await getStreamUrlFromVix(destinationUrl, numericVideoId);
+                
+                // Pre-load DRM in background (non-blocking) so player has license ready
+                if (m3u8Url) {
+                    ensureDrmReady(destinationUrl).catch(err => 
+                        log.warn(`DRM pre-load failed (non-blocking): ${err.message}`)
+                    );
+                }
             } else {
                 log.warn(`Could not extract numeric video ID from token "${videoToken}"`);
             }
         }
 
-        // If we got a .mpd, strip SSAI ads and serve via local proxy
-        if (m3u8Url && m3u8Url.includes(".mpd")) {
-            const localBase = `http://${CONFIG.PROXY_HOST}:${CONFIG.PORT + 1}`;
-            m3u8Url = await getCleanMpdUrl(m3u8Url, localBase);
-            log.info(`Clean MPD proxy URL: ${m3u8Url}`);
-        }
-
+        // For external players (like MX Player), send direct URL without proxy
+        // MX Player has native Widevine support and works better with direct URLs
         log.info(`Dispatching: m3u8=${m3u8Url ? "found" : "none"} url=${destinationUrl}`);
 
         const stream = m3u8Url
             ? {
                 name:  "Vix Hub Pro",
                 title: type === "series" ? `S${targetSeason}E${targetEpisode} • ViX` : "Movie • ViX",
-                url:   m3u8Url,
+                url:   m3u8Url,  // Direct HLS/DASH URL (MX Player has native Widevine support)
               }
             : {
                 name:        "Vix Hub Pro",
                 title:       type === "series" ? `Open S${targetSeason}E${targetEpisode} on ViX` : "Open on ViX",
                 externalUrl: destinationUrl,
               };
+
+        console.log(`[STREAM RESPONSE] URL: ${stream.url || stream.externalUrl}`);
+        console.log(`[STREAM RESPONSE] Full object:`, JSON.stringify(stream, null, 2));
 
         return { streams: [stream] };
 
@@ -1393,6 +1503,24 @@ app.post("/api/settings", express.json(), (req, res) => {
         res.json({ success: true });
     } else {
         res.status(400).json({ error: "tvdbApiKey required" });
+    }
+});
+
+// Debug endpoint — return original MPD URL before proxy
+app.get("/debug/original-mpd/:videoId", async (req, res) => {
+    const videoId = req.params.videoId;
+    try {
+        const mpdUrl = await getStreamUrlFromVix(
+            `https://vix.com/es-es/video/video-${videoId}`,
+            videoId
+        );
+        if (!mpdUrl) {
+            res.status(404).json({ error: "Could not resolve MPD" });
+            return;
+        }
+        res.json({ originalMpdUrl: mpdUrl });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
