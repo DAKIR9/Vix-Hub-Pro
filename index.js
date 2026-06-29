@@ -1326,11 +1326,12 @@ async function ensureDrmReady(videoPageUrl) {
                 m3u8Url = await getStreamUrlFromVix(destinationUrl, numericVideoId);
                 
                 // Pre-load DRM in background (non-blocking) so player has license ready
-                if (m3u8Url) {
-                    ensureDrmReady(destinationUrl).catch(err => 
-                        log.warn(`DRM pre-load failed (non-blocking): ${err.message}`)
-                    );
-                }
+                // DISABLED on Render: Puppeteer unavailable
+                // if (m3u8Url) {
+                //     ensureDrmReady(destinationUrl).catch(err => 
+                //         log.warn(`DRM pre-load failed (non-blocking): ${err.message}`)
+                //     );
+                // }
             } else {
                 log.warn(`Could not extract numeric video ID from token "${videoToken}"`);
             }
