@@ -1254,13 +1254,20 @@ builder.defineStreamHandler(async (args) => {
 // Cache for DRM pre-load so we don't re-launch Puppeteer multiple times
 const drmPreloadCache = new Map();
 
+// Detect if running on cloud (Render, Heroku, etc.) — disable Puppeteer there
+const isCloudServer = process.env.RENDER || process.env.DYNO || process.env.VERCEL;
+
 // ─────────────────────────────────────────────
 // Puppeteer DRM Pre-loader (non-blocking background task)
-// Loads page in Puppeteer to ensure Widevine DRM license is obtained
-// This happens after the fast JWT method returns, so it doesn't delay response
-// Cached so we don't re-load the same video multiple times
+// DISABLED on cloud servers (Render, Heroku) due to sandbox/Chrome unavailability
+// On local machine: loads page to ensure Widevine DRM license is obtained
 // ─────────────────────────────────────────────
 async function ensureDrmReady(videoPageUrl) {
+    // Skip on cloud servers
+    if (isCloudServer) {
+        return;
+    }
+
     // Check if we already pre-loaded this URL recently (within 1 hour)
     if (drmPreloadCache.has(videoPageUrl)) {
         const cached = drmPreloadCache.get(videoPageUrl);
@@ -1369,9 +1376,9 @@ const settingsFile = "./settings.json";
 
 function loadSettings() {
     try {
-        const fs = require("fs");
-        if (fs.existsSync(settingsFile)) {
-            const data = fs.readFileSync(settingsFile, "utf8");
+        const fs = await import("fs");
+        if (fs.default.existsSync(settingsFile)) {
+            const data = fs.default.readFileSync(settingsFile, "utf8");
             return JSON.parse(data);
         }
     } catch (err) {
