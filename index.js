@@ -1023,43 +1023,31 @@ async function getStreamUrlFromVix(videoPageUrl, numericVideoId) {
         let luraToken = getCachedJWT(numericVideoId);
         
         if (!luraToken) {
-            // Step 2: Cache miss — launch Puppeteer to extract fresh JWT
-            log.info(`[PUPPETEER] Launching browser for video ${numericVideoId}...`);
-            const puppeteer = (await import("puppeteer")).default;
-            let browser;
+            // Puppeteer DISABLED on cloud servers (Render)
+            // Use lightweight HTTP method instead
+            // const puppeteer = (await import("puppeteer")).default;
+            let browser = null;
             try {
-                browser = await puppeteer.launch({
-                    headless: "new",
-                    args: [
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--mute-audio",
-                    ],
-                });
-
-                const page = await browser.newPage();
-                await page.goto(videoPageUrl, {
-                    waitUntil: "domcontentloaded", // Faster than networkidle2
-                    timeout: 20_000,
-                });
-
-                // Extract JWT from page HTML
-                const pageContent = await page.content();
-                const tokenMatch = pageContent.match(/eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+/);
+                // DISABLED: browser = await puppeteer.launch({
+                //   ...
+                // });
                 
-                if (!tokenMatch) {
-                    log.warn(`No JWT found in page for video ${numericVideoId}`);
-                    return null;
+                // Fallback: Extract JWT via HTTP regex (lightweight, no browser)
+                const { data: html } = await axios.get(videoPageUrl, {
+                    headers: {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Accept": "text/html",
+                    },
+                    timeout: 10000,
+                });
+                const tokenMatch = html.match(/eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+/);
+                if (tokenMatch) {
+                    luraToken = tokenMatch[0];
+                    cacheJWT(numericVideoId, luraToken);
                 }
-
-                luraToken = tokenMatch[0];
-                cacheJWT(numericVideoId, luraToken); // Cache for next 30 min
-                log.info(`[PUPPETEER] JWT extracted and cached for video ${numericVideoId}`);
-
-            } finally {
-                if (browser) await browser.close().catch(() => {});
+                
+            } catch (err) {
+                log.warn(`JWT extraction via HTTP failed: ${err.message}`);
             }
         }
 
