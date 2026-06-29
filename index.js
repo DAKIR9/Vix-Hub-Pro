@@ -3,6 +3,7 @@ const { addonBuilder, serveHTTP } = pkg;
 import axios from "axios";
 import express from "express";
 import os from "os";
+import fs from "fs";
 let DOMParser, XMLSerializer;
 try {
     ({ DOMParser, XMLSerializer } = await import("@xmldom/xmldom"));
@@ -1376,9 +1377,9 @@ const settingsFile = "./settings.json";
 
 function loadSettings() {
     try {
-        const fs = await import("fs");
-        if (fs.default.existsSync(settingsFile)) {
-            const data = fs.default.readFileSync(settingsFile, "utf8");
+        const fs = require("fs");
+        if (fs.existsSync(settingsFile)) {
+            const data = fs.readFileSync(settingsFile, "utf8");
             return JSON.parse(data);
         }
     } catch (err) {
@@ -1389,7 +1390,6 @@ function loadSettings() {
 
 function saveSettings(settings) {
     try {
-        const fs = require("fs");
         fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2), "utf8");
     } catch (err) {
         console.error(`Settings save failed: ${err.message}`);
